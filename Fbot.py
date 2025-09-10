@@ -8,6 +8,7 @@ from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -32,7 +33,7 @@ REPORT_INTERVAL_DAYS = 10  # Интервал автоотчетов в днях
 # Стандартные категории расходов
 DEFAULT_CATEGORIES = {
     "outsource_salary": "Зарплаты сотрудников аутсорса",
-    "staff_salary": "Зарплаты штата",
+    "staff_salary": "Зарплаты штата", 
     "office": "Офис, канцелярия, материалы",
     "legal": "Расходы юр. лиц",
     "other": "Прочее"
@@ -74,10 +75,6 @@ class EmployeeStates(StatesGroup):
     waiting_for_name = State()
     waiting_for_phone = State()
     waiting_for_birthday = State()
-
-class CategoryStates(StatesGroup):
-    waiting_for_name = State()
-    waiting_for_display_name = State()
 
 # Database класс
 class Database:
@@ -148,6 +145,17 @@ class Database:
                 phone TEXT NOT NULL,
                 birthday TEXT NOT NULL,
                 added_date TEXT NOT NULL
+            )
+            """)
+            
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS admin_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation_type TEXT NOT NULL,
+                operation_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                UNIQUE(operation_type, operation_id, chat_id)
             )
             """)
             
@@ -433,6 +441,43 @@ class Database:
             logger.error(f"Error setting report interval: {e}")
             return False
 
+    async def add_admin_message(self, operation_type: str, operation_id: int, chat_id: int, message_id: int):
+        """Сохраняет сообщение админу о необходимости подтверждения"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO admin_messages (operation_type, operation_id, chat_id, message_id)
+                VALUES (?, ?, ?, ?)
+            """, (operation_type, operation_id, chat_id, message_id))
+            self.conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Error saving admin message: {e}")
+
+    async def get_operation_messages(self, operation_type: str, operation_id: int) -> List[Dict]:
+        """Получает все сообщения админов по конкретной операции"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT chat_id, message_id FROM admin_messages 
+                WHERE operation_type = ? AND operation_id = ?
+            """, (operation_type, operation_id))
+            return [{"chat_id": row[0], "message_id": row[1]} for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"Error getting operation messages: {e}")
+            return []
+
+    async def clear_operation_messages(self, operation_type: str, operation_id: int):
+        """Очищает сохраненные сообщения об операции"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                DELETE FROM admin_messages 
+                WHERE operation_type = ? AND operation_id = ?
+            """, (operation_type, operation_id))
+            self.conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Error clearing operation messages: {e}")
+
     def close(self):
         if self.conn:
             self.conn.close()
@@ -465,7 +510,7 @@ async def cmd_start(message: Message, state: FSMContext, **kwargs):
         "Привет! Я бот для учета финансов.\n\n"
         "Доступные команды:\n"
         "/income - добавить доход\n"
-        "/expense - добавить расход\n"
+        "/expense - добавить расход\n" 
         "/history - история операций"
     )
 
@@ -473,7 +518,7 @@ async def cmd_start(message: Message, state: FSMContext, **kwargs):
 @error_handler
 async def cmd_income(message: Message, state: FSMContext, **kwargs):
     builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(text="Отмена", callback_data="cancel"))
+    builder.add(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_income"))
     
     await message.answer(
         "Введите сумму дохода (только число):",
@@ -484,12 +529,17 @@ async def cmd_income(message: Message, state: FSMContext, **kwargs):
 @user_router.message(IncomeStates.waiting_for_amount)
 @error_handler
 async def process_income_amount(message: Message, state: FSMContext, **kwargs):
+    if message.text.lower() in ["отмена", "/cancel"]:
+        await state.clear()
+        await message.answer("❌ Добавление дохода отменено")
+        return
+    
     try:
         amount = float(message.text.replace(",", "."))
         await state.update_data(amount=amount)
         
         builder = InlineKeyboardBuilder()
-        builder.add(InlineKeyboardButton(text="Отмена", callback_data="cancel"))
+        builder.add(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_income"))
         
         await message.answer(
             "Введите комментарий к доходу:",
@@ -497,11 +547,16 @@ async def process_income_amount(message: Message, state: FSMContext, **kwargs):
         )
         await state.set_state(IncomeStates.waiting_for_comment)
     except ValueError:
-        await message.answer("Некорректная сумма. Введите число:")
+        await message.answer("Некорректная сумма. Введите число или 'Отмена'")
 
 @user_router.message(IncomeStates.waiting_for_comment)
 @error_handler
 async def process_income_comment(message: Message, state: FSMContext, **kwargs):
+    if message.text.lower() in ["отмена", "/cancel"]:
+        await state.clear()
+        await message.answer("❌ Добавление дохода отменено")
+        return
+    
     data = await state.get_data()
     income_id = await db.add_income(
         message.from_user.id,
@@ -523,7 +578,7 @@ async def process_income_comment(message: Message, state: FSMContext, **kwargs):
     
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(
+            msg = await bot.send_message(
                 chat_id=admin_id,
                 text=(
                     f"Новый доход на подтверждение:\n"
@@ -533,6 +588,7 @@ async def process_income_comment(message: Message, state: FSMContext, **kwargs):
                 ),
                 reply_markup=keyboard.as_markup()
             )
+            await db.add_admin_message("income", income_id, admin_id, msg.message_id)
         except Exception as e:
             logger.error(f"Error sending confirmation to admin {admin_id}: {e}")
     
@@ -556,7 +612,7 @@ async def cmd_expense(message: Message, state: FSMContext, **kwargs):
     )
     # Добавляем кнопку отмены в отдельный ряд
     keyboard.inline_keyboard.append(
-        [InlineKeyboardButton(text="Отмена", callback_data="cancel_expense_action")]
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_expense_action")]
     )
     
     await message.answer(
@@ -564,6 +620,126 @@ async def cmd_expense(message: Message, state: FSMContext, **kwargs):
         reply_markup=keyboard
     )
     await state.set_state(ExpenseStates.waiting_for_category)
+
+@user_router.callback_query(F.data == "cancel_expense_action", ExpenseStates.waiting_for_category)
+@error_handler
+async def cancel_expense_category(callback: CallbackQuery, state: FSMContext, **kwargs):
+    await state.clear()
+    await callback.message.edit_text("❌ Добавление расхода отменено")
+    await callback.answer()
+
+@user_router.callback_query(F.data.startswith("expense_cat_"), ExpenseStates.waiting_for_category)
+@error_handler
+async def process_expense_category(callback: CallbackQuery, state: FSMContext, **kwargs):
+    if callback.data == "cancel_expense_action":  # Добавьте эту проверку
+        await state.clear()
+        await callback.message.edit_text("❌ Добавление расхода отменено")
+        await callback.answer()
+        return
+        
+    category = callback.data.split("_")[2]
+    await state.update_data(category=category)
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_expense_action")]]
+    )
+    
+    await callback.message.edit_text(
+        text="Введите сумму расхода (только число):",
+        reply_markup=keyboard
+    )
+    await state.set_state(ExpenseStates.waiting_for_amount)
+    await callback.answer()
+
+@user_router.message(ExpenseStates.waiting_for_amount)
+@error_handler
+async def process_expense_amount(message: Message, state: FSMContext, **kwargs):
+    if message.text.lower() in ["отмена", "/cancel"]:
+        await state.clear()
+        await message.answer("❌ Добавление расхода отменено")
+        return
+    
+    try:
+        amount = float(message.text.replace(",", "."))
+        await state.update_data(amount=amount)
+        
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_expense_action")]]
+        )
+        
+        await message.answer(
+            "Введите комментарий к расходу:",
+            reply_markup=keyboard
+        )
+        await state.set_state(ExpenseStates.waiting_for_comment)
+    except ValueError:
+        await message.answer("Некорректная сумма. Введите число или напишите 'Отмена'")
+
+@user_router.callback_query(F.data == "cancel_expense_action")
+@error_handler
+async def handle_expense_cancel(callback: CallbackQuery, state: FSMContext, **kwargs):
+    await state.clear()
+    await callback.message.edit_text("❌ Добавление расхода отменено")
+    await callback.answer()
+
+@user_router.message(ExpenseStates.waiting_for_comment)
+@error_handler
+async def process_expense_comment(message: Message, state: FSMContext, **kwargs):
+    # Обработка команды отмены
+    if message.text.lower() in ["отмена", "/cancel"]:
+        await state.clear()
+        await message.answer("❌ Добавление расхода отменено")
+        return
+    
+    # Получаем сохраненные данные
+    data = await state.get_data()
+    
+    # Добавляем расход в БД
+    expense_id = await db.add_expense(
+        user_id=message.from_user.id,
+        user_name=message.from_user.full_name,
+        category=data['category'],
+        amount=data['amount'],
+        comment=message.text
+    )
+    
+    if expense_id is None:
+        await message.answer("❌ Ошибка при сохранении расхода")
+        await state.clear()
+        return
+    
+    # Получаем название категории для отображения
+    categories = await db.get_categories()
+    category_name = categories.get(data['category'], data['category'])
+    
+    # Создаем клавиатуру для подтверждения
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(
+        InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"confirm_expense_{expense_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_expense_{expense_id}")
+    )
+    
+    # Отправляем запрос на подтверждение всем админам
+    for admin_id in ADMIN_IDS:
+        try:
+            msg = await bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"🔄 Запрос на подтверждение расхода:\n"
+                    f"Категория: {category_name}\n"
+                    f"Сумма: {data['amount']} руб.\n"
+                    f"Комментарий: {message.text}\n"
+                    f"Пользователь: {message.from_user.full_name}"
+                ),
+                reply_markup=keyboard.as_markup()
+            )
+            # Сохраняем сообщение для последующего обновления
+            await db.add_admin_message("expense", expense_id, admin_id, msg.message_id)
+        except Exception as e:
+            logger.error(f"Error sending confirmation to admin {admin_id}: {e}")
+    
+    await message.answer("📤 Запрос на расход отправлен администратору")
+    await state.clear()
 
 @user_router.message(Command("history"))
 @error_handler
@@ -631,79 +807,31 @@ async def process_history_period(callback: CallbackQuery, **kwargs):
     )
     await callback.answer()
 
-@user_router.callback_query(F.data.startswith("expense_cat_"), ExpenseStates.waiting_for_category)
+@user_router.callback_query(F.data == "cancel_history")
 @error_handler
-async def process_expense_category(callback: CallbackQuery, state: FSMContext, **kwargs):
-    category = callback.data.split("_")[2]
-    await state.update_data(category=category)
-    
-    keyboard = InlineKeyboardBuilder()
-    keyboard.add(InlineKeyboardButton(text="Отмена", callback_data="cancel_expense"))
-    
-    await callback.message.edit_text(
-        text="Введите сумму расхода (только число):",
-        reply_markup=keyboard.as_markup()
-    )
-    await state.set_state(ExpenseStates.waiting_for_amount)
+async def cancel_history(callback: CallbackQuery, **kwargs):
+    await callback.message.edit_text("❌ Просмотр истории отменен")
     await callback.answer()
 
-@user_router.message(ExpenseStates.waiting_for_amount)
+@user_router.callback_query(F.data == "cancel_income")
 @error_handler
-async def process_expense_amount(message: Message, state: FSMContext, **kwargs):
-    try:
-        amount = float(message.text.replace(",", "."))
-        await state.update_data(amount=amount)
-        
-        builder = InlineKeyboardBuilder()
-        builder.add(InlineKeyboardButton(text="Отмена", callback_data="cancel_expense"))
-        
-        await message.answer(
-            "Введите комментарий к расходу:",
-            reply_markup=builder.as_markup()
-        )
-        await state.set_state(ExpenseStates.waiting_for_comment)
-    except ValueError:
-        await message.answer("Некорректная сумма. Введите число:")
-
-@user_router.message(ExpenseStates.waiting_for_comment)
-@error_handler
-async def process_expense_comment(message: Message, state: FSMContext, **kwargs):
-    data = await state.get_data()
-    expense_id = await db.add_expense(
-        user_id=message.from_user.id,
-        user_name=message.from_user.full_name,
-        category=data['category'],
-        amount=data['amount'],
-        comment=message.text
-    )
-    
-    if expense_id is None:
-        await message.answer("❌ Ошибка при сохранении расхода")
-        await state.clear()
-        return
-    
-    categories = await db.get_categories()
-    category_name = categories.get(data['category'], data['category'])
-    
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(
-        InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"confirm_expense_{expense_id}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_expense_{expense_id}")
-    )
-    
-    for admin_id in ADMIN_IDS:
-        await bot.send_message(
-            chat_id=admin_id,
-            text=f"🔄 Запрос на подтверждение расхода:\n"
-                 f"Категория: {category_name}\n"
-                 f"Сумма: {data['amount']} руб.\n"
-                 f"Комментарий: {message.text}\n"
-                 f"Пользователь: {message.from_user.full_name}",
-            reply_markup=keyboard.as_markup()
-        )
-    
-    await message.answer("📤 Запрос на расход отправлен администратору")
+async def cancel_income_handler(callback: CallbackQuery, state: FSMContext, **kwargs):
     await state.clear()
+    await callback.message.edit_text("❌ Добавление дохода отменено")
+    await callback.answer()
+
+@user_router.message(Command("cancel"))
+@error_handler
+async def cmd_cancel(message: Message, state: FSMContext, **kwargs):
+    current_state = await state.get_state()
+    if current_state in IncomeStates.__states__:
+        await state.clear()
+        await message.answer("❌ Добавление дохода отменено")
+    elif current_state in ExpenseStates.__states__:
+        await state.clear()
+        await message.answer("❌ Добавление расхода отменено")
+    else:
+        await message.answer("ℹ️ Нет активных операций для отмены")
 
 # Хэндлеры для админов
 @admin_router.message(Command("add_employee"), admin_filter)
@@ -712,7 +840,7 @@ async def cmd_add_employee(message: Message, state: FSMContext, **kwargs):
     await state.update_data(messages_to_delete=[message.message_id])
     
     builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(text="Отмена", callback_data="cancel_employee"))
+    builder.add(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_employee"))
     
     msg = await message.answer(
         "Введите ФИО нового сотрудника:",
@@ -748,7 +876,7 @@ async def process_employee_name(message: Message, state: FSMContext, **kwargs):
     await state.set_data(new_data)
     
     builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(text="Отмена", callback_data="cancel_employee"))
+    builder.add(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_employee"))
     
     msg = await message.answer(
         "Введите телефон сотрудника:",
@@ -774,7 +902,7 @@ async def process_employee_phone(message: Message, state: FSMContext, **kwargs):
     await state.set_data(new_data)
     
     builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(text="Отмена", callback_data="cancel_employee"))
+    builder.add(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_employee"))
     
     msg = await message.answer(
         "Введите дату рождения сотрудника (ДД.ММ.ГГГГ):",
@@ -856,199 +984,59 @@ async def cmd_employees(message: Message, **kwargs):
     
     await message.answer(text[:4000])
 
-# Общие хэндлеры
-@dp.callback_query(F.data == "cancel")
-@error_handler
-async def cancel_handler(callback: CallbackQuery, state: FSMContext, **kwargs):
-    await state.clear()
-    await callback.message.edit_text("Действие отменено")
-    await callback.answer()
-
-@admin_router.callback_query(F.data.startswith("confirm_expense_"))
-@error_handler
-async def confirm_expense(callback: CallbackQuery, **kwargs):
-    try:
-        expense_id = int(callback.data.split("_")[2])
-        
-        if not await db.confirm_expense(expense_id):
-            await callback.message.edit_text("❌ Расход не найден")
-            await callback.answer()
-            return
-            
-        cursor = db.conn.cursor()
-        cursor.execute(
-            "SELECT user_id, user_name, category, amount, comment FROM expenses WHERE id = ?",
-            (expense_id,)
-        )
-        expense = cursor.fetchone()
-        
-        if not expense:
-            await callback.message.edit_text("❌ Данные расхода не найдены")
-            await callback.answer()
-            return
-            
-        user_id, user_name, category, amount, comment = expense
-        
-        categories = await db.get_categories()
-        category_name = categories.get(category, category)
-        
-        try:
-            await bot.send_message(
-                chat_id=GROUP_ID,
-                text=f"💸 Подтвержден расход:\n"
-                     f"Категория: {category_name}\n"
-                     f"Сумма: {amount} руб.\n"
-                     f"Комментарий: {comment}\n"
-                     f"Пользователь: {user_name}"
-            )
-        except Exception as e:
-            logger.error(f"Не удалось отправить в группу: {e}")
-        
-        await callback.message.edit_text("✅ Расход подтвержден")
-        
-    except Exception as e:
-        logger.error(f"Ошибка подтверждения расхода: {e}")
-        await callback.message.edit_text("❌ Ошибка при обработке")
-    finally:
-        await callback.answer()
-
-@dp.callback_query(F.data.startswith("confirm_income_"))
+# Обработчики подтверждения/отклонения операций
+@admin_router.callback_query(F.data.startswith("confirm_income_"))
 @error_handler
 async def confirm_income(callback: CallbackQuery, **kwargs):
     income_id = int(callback.data.split("_")[2])
     
     if await db.confirm_income(income_id):
+        # Получаем все сообщения админов об этой операции
+        messages = await db.get_operation_messages("income", income_id)
+        
+        # Обновляем сообщения у всех админов
+        for msg in messages:
+            try:
+                await bot.edit_message_text(
+                    chat_id=msg["chat_id"],
+                    message_id=msg["message_id"],
+                    text="✅ Доход подтвержден",
+                    reply_markup=None  # Убираем кнопки
+                )
+            except Exception as e:
+                logger.error(f"Error updating message for admin {msg['chat_id']}: {e}")
+        
+        # Удаляем записи о сообщениях
+        await db.clear_operation_messages("income", income_id)
+        
+        # Получаем данные о доходе для уведомлений
         cursor = db.conn.cursor()
         cursor.execute(
-            "SELECT user_name, amount, comment FROM incomes WHERE id = ?",
+            "SELECT user_id, user_name, amount, comment FROM incomes WHERE id = ?",
             (income_id,)
         )
         income_data = cursor.fetchone()
         
         if income_data:
-            user_name, amount, comment = income_data
+            user_id, user_name, amount, comment = income_data
             
+            # Уведомляем группу
             await bot.send_message(
                 chat_id=GROUP_ID,
-                text=f"✅ Подтвержден доход:\n"
-                     f"Сумма: {amount} руб.\n"
-                     f"От: {user_name}\n"
-                     f"Комментарий: {comment}"
-            )
-            
-            await callback.message.edit_text("✅ Доход подтвержден")
-        else:
-            await callback.message.edit_text("❌ Не удалось найти данные о доходе")
-    else:
-        await callback.message.edit_text("❌ Не удалось подтвердить доход")
-    
-    await callback.answer()
-
-@admin_router.callback_query(F.data.startswith("reject_expense_"))
-@error_handler
-async def reject_expense(callback: CallbackQuery, **kwargs):
-    expense_id = int(callback.data.split("_")[2])
-    
-    cursor = db.conn.cursor()
-    cursor.execute(
-        "SELECT user_id, user_name, category, amount, comment FROM expenses WHERE id = ?",
-        (expense_id,)
-    )
-    expense_data = cursor.fetchone()
-    
-    if expense_data and await db.delete_expense(expense_id):
-        user_id, user_name, category, amount, comment = expense_data
-        
-        categories = await db.get_categories()
-        category_name = categories.get(category, category)
-        
-        logger.info(f"Expense rejected: id={expense_id}, user_id={user_id}")
-        
-        await bot.send_message(
-            chat_id=GROUP_ID,
-            text=(
-                f"❌ Расход отклонен администратором:\n"
-                f"Категория: {category_name}\n"
-                f"Сумма: {amount} руб.\n"
-                f"Пользователь: {user_name}\n"
-                f"Комментарий: {comment}\n"
-                f"Админ: {callback.from_user.full_name}"
-            )
-        )
-        
-        try:
-            await bot.send_message(
-                chat_id=user_id,
                 text=(
-                    f"Ваш расход {amount} руб. (категория: {category_name}) "
-                    f"был отклонен администратором {callback.from_user.full_name}"
+                    f"✅ Подтвержден доход:\n"
+                    f"Сумма: {amount} руб.\n"
+                    f"От: {user_name}\n"
+                    f"Комментарий: {comment}"
                 )
             )
-        except Exception as e:
-            logger.error(f"Не удалось уведомить пользователя {user_id}: {e}")
-        
-        await callback.message.edit_text("✅ Расход успешно отклонен")
-    else:
-        await callback.message.edit_text("❌ Не удалось отклонить расход")
-        logger.error(f"Ошибка при отклонении расхода: id={expense_id}")
-    
-    await callback.answer()
 
-@admin_router.callback_query(F.data.startswith("reject_expense_"))
-@error_handler
-async def reject_expense(callback: CallbackQuery, **kwargs):
-    expense_id = int(callback.data.split("_")[2])
-    
-    cursor = db.conn.cursor()
-    cursor.execute(
-        "SELECT user_id, user_name, category, amount, comment FROM expenses WHERE id = ?",
-        (expense_id,)
-    )
-    expense_data = cursor.fetchone()
-    
-    if expense_data and await db.delete_expense(expense_id):
-        user_id, user_name, category, amount, comment = expense_data
-        
-        categories = await db.get_categories()
-        category_name = categories.get(category, category)
-        
-        logger.info(f"Expense rejected: id={expense_id}, user_id={user_id}")
-        
-        await bot.send_message(
-            chat_id=GROUP_ID,
-            text=(
-                f"❌ Расход отклонен администратором:\n"
-                f"Категория: {category_name}\n"
-                f"Сумма: {amount} руб.\n"
-                f"Пользователь: {user_name}\n"
-                f"Комментарий: {comment}\n"
-                f"Админ: {callback.from_user.full_name}"
-            )
-        )
-        
-        try:
-            await bot.send_message(
-                chat_id=user_id,
-                text=(
-                    f"Ваш расход {amount} руб. (категория: {category_name}) "
-                    f"был отклонен администратором {callback.from_user.full_name}"
-                )
-            )
-        except Exception as e:
-            logger.error(f"Не удалось уведомить пользователя {user_id}: {e}")
-        
-        await callback.message.edit_text("✅ Расход успешно отклонен")
-    else:
-        await callback.message.edit_text("❌ Не удалось отклонить расход")
-        logger.error(f"Ошибка при отклонении расхода: id={expense_id}")
-    
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("reject_income_"))
+@admin_router.callback_query(F.data.startswith("reject_income_"))
 @error_handler
 async def reject_income(callback: CallbackQuery, **kwargs):
     income_id = int(callback.data.split("_")[2])
     
+    # Получаем данные о доходе перед удалением
     cursor = db.conn.cursor()
     cursor.execute(
         "SELECT user_id, user_name, amount, comment FROM incomes WHERE id = ?",
@@ -1059,8 +1047,27 @@ async def reject_income(callback: CallbackQuery, **kwargs):
     if income_data and await db.reject_income(income_id):
         user_id, user_name, amount, comment = income_data
         
+        # Получаем все сообщения админов об этой операции
+        messages = await db.get_operation_messages("income", income_id)
+        
+        # Обновляем сообщения у всех админов
+        for msg in messages:
+            try:
+                await bot.edit_message_text(
+                    chat_id=msg["chat_id"],
+                    message_id=msg["message_id"],
+                    text="❌ Доход отклонен"
+                )
+            except Exception as e:
+                logger.error(f"Error updating admin message: {e}")
+        
+        # Удаляем записи о сообщениях
+        await db.clear_operation_messages("income", income_id)
+        
+        # Логируем действие
         logger.info(f"Income rejected: id={income_id}, user_id={user_id}")
         
+        # Уведомляем группу
         await bot.send_message(
             chat_id=GROUP_ID,
             text=(
@@ -1072,6 +1079,7 @@ async def reject_income(callback: CallbackQuery, **kwargs):
             )
         )
         
+        # Уведомляем пользователя
         try:
             await bot.send_message(
                 chat_id=user_id,
@@ -1087,6 +1095,125 @@ async def reject_income(callback: CallbackQuery, **kwargs):
     else:
         await callback.message.edit_text("❌ Не удалось отклонить доход")
         logger.error(f"Ошибка при отклонении дохода: id={income_id}")
+    
+    await callback.answer()
+
+@admin_router.callback_query(F.data.startswith("confirm_expense_"))
+@error_handler
+async def confirm_expense(callback: CallbackQuery, **kwargs):
+    expense_id = int(callback.data.split("_")[2])
+    
+    if await db.confirm_expense(expense_id):
+        # Получаем все сообщения админов об этой операции
+        messages = await db.get_operation_messages("expense", expense_id)
+        
+        # Обновляем сообщения у всех админов
+        for msg in messages:
+            try:
+                await bot.edit_message_text(
+                    chat_id=msg["chat_id"],
+                    message_id=msg["message_id"],
+                    text="✅ Расход подтвержден",
+                    reply_markup=None  # Убираем кнопки
+                )
+            except Exception as e:
+                logger.error(f"Error updating message for admin {msg['chat_id']}: {e}")
+        
+        # Удаляем записи о сообщениях
+        await db.clear_operation_messages("expense", expense_id)
+        
+        # Получаем данные о расходе для уведомлений
+        cursor = db.conn.cursor()
+        cursor.execute(
+            "SELECT user_id, user_name, category, amount, comment FROM expenses WHERE id = ?",
+            (expense_id,)
+        )
+        expense_data = cursor.fetchone()
+        
+        if expense_data:
+            user_id, user_name, category, amount, comment = expense_data
+            categories = await db.get_categories()
+            category_name = categories.get(category, category)
+            
+            # Уведомляем группу
+            await bot.send_message(
+                chat_id=GROUP_ID,
+                text=(
+                    f"✅ Подтвержден расход:\n"
+                    f"Категория: {category_name}\n"
+                    f"Сумма: {amount} руб.\n"
+                    f"Пользователь: {user_name}\n"
+                    f"Комментарий: {comment}"
+                )
+            )
+
+@admin_router.callback_query(F.data.startswith("reject_expense_"))
+@error_handler
+async def reject_expense(callback: CallbackQuery, **kwargs):
+    expense_id = int(callback.data.split("_")[2])
+    
+    # Получаем данные о расходе перед удалением
+    cursor = db.conn.cursor()
+    cursor.execute(
+        "SELECT user_id, user_name, category, amount, comment FROM expenses WHERE id = ?",
+        (expense_id,)
+    )
+    expense_data = cursor.fetchone()
+    
+    if expense_data and await db.delete_expense(expense_id):
+        user_id, user_name, category, amount, comment = expense_data
+        
+        # Получаем все сообщения админов об этой операции
+        messages = await db.get_operation_messages("expense", expense_id)
+        
+        # Обновляем сообщения у всех админов
+        for msg in messages:
+            try:
+                await bot.edit_message_text(
+                    chat_id=msg["chat_id"],
+                    message_id=msg["message_id"],
+                    text="❌ Расход отклонен"
+                )
+            except Exception as e:
+                logger.error(f"Error updating admin message: {e}")
+        
+        # Удаляем записи о сообщениях
+        await db.clear_operation_messages("expense", expense_id)
+        
+        categories = await db.get_categories()
+        category_name = categories.get(category, category)
+        
+        logger.info(f"Expense rejected: id={expense_id}, user_id={user_id}")
+        
+        # Уведомляем группу
+        await bot.send_message(
+            chat_id=GROUP_ID,
+            text=(
+                f"❌ Расход отклонен администратором:\n"
+                f"Категория: {category_name}\n"
+                f"Сумма: {amount} руб.\n"
+                f"Пользователь: {user_name}\n"
+                f"Комментарий: {comment}\n"
+                f"Админ: {callback.from_user.full_name}"
+            )
+        )
+        
+        # Уведомляем пользователя
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"Ваш расход {amount} руб. (категория: {category_name}) "
+                    f"был отклонен администратором {callback.from_user.full_name}"
+                )
+            )
+        except Exception as e:
+            logger.error(f"Не удалось уведомить пользователя {user_id}: {e}")
+        
+        await callback.message.edit_text("✅ Расход успешно отклонен")
+    else:
+        await callback.message.edit_text("❌ Не удалось отклонить расход")
+        logger.error(f"Ошибка при отклонении расхода: id={expense_id}")
     
     await callback.answer()
 
